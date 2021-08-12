@@ -16,7 +16,7 @@
 # under the License.
 
 # Build environment that can be used to build tvm.
-name: hago
+name: tvm-build
 
 # The conda channels to lookup the dependencies
 channels:
