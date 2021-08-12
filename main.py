@@ -159,7 +159,6 @@ def get_model(model_name, batch_size, qconfig, original=False, simulated=False, 
     with qconfig:
         logging.debug('current quantize config')
         logging.debug(hago.current_qconfig())
-        # import pdb; pdb.set_trace()
         hardware = hago.create_accelerator_description()
         space = hago.generate_search_space(graph, hardware)
         # tuner = hago.BatchedGreedySearchTuner(space, 'accuracy')
@@ -183,7 +182,7 @@ def get_model(model_name, batch_size, qconfig, original=False, simulated=False, 
         return quantized_graph, params
 
 
-def tune_eval(mod, params, dataset, batch_fn, tuning_opt, target='cuda', ctx=tvm.gpu(), log_interval=100):
+def tune_eval(mod, params, tuning_opt, target='cuda', ctx=tvm.gpu(), log_interval=100):
 
     # extract workloads from relay program
     print("Extract tasks...")
@@ -198,32 +197,14 @@ def tune_eval(mod, params, dataset, batch_fn, tuning_opt, target='cuda', ctx=tvm
     input_shape = (batch_size, 3, 224, 224)
     output_shape = (batch_size, 1000)
     
-    tune_start = time.time()
     if args.tune:    
         tasks = autotvm.task.extract_from_program(
             mod["main"], target=target, params=params, ops=(relay.op.get("nn.conv2d"),)
         )
-        
         # run tuning tasks
         print("Tuning...")
         # import pdb; pdb.set_trace()
         tune_tasks(tasks, **tuning_opt)
-        
-        '''
-        # compile kernels with history best records
-        with autotvm.apply_history_best(log_file):
-            print("Compile...")
-            with tvm.transform.PassContext(opt_level=3):
-                lib = relay.build_module.build(mod, target=target, params=params)
-
-            # load parameters
-            dev = tvm.device(str(target), 0)
-            module = runtime.GraphModule(lib["default"](dev))
-            data_tvm = tvm.nd.array((np.random.uniform(size=input_shape)).astype(dtype))
-            module.set_input("data", data_tvm)
-        '''
-    tune_end = time.time()
-    print("Tuning time : %.3f"%(tune_end-tune_start))
 
     with autotvm.apply_history_best(log_file):
         print("Compile...")
@@ -238,10 +219,7 @@ def tune_eval(mod, params, dataset, batch_fn, tuning_opt, target='cuda', ctx=tvm
         elif args.debug:
             # create debug runtime
             m = debug_runtime.create(graph, lib, ctx, dump_root="/tmp/tvmdbg")
-        
         m.set_input(**params)
-
-        # executor = relay.create_executor("vm", tvm.IRModule.from_expr(mod), ctx ,target)
  
         ######################################################################
         # Time evaluator
@@ -249,67 +227,6 @@ def tune_eval(mod, params, dataset, batch_fn, tuning_opt, target='cuda', ctx=tvm
         t = np.array(e().results)*1000
         print("time_evaluator: %.3fms (%.5fms)"%(t.mean(), t.std()))
         ######################################################################
-
-        '''
-        # setup evaluaiton metric
-        dataset.reset()
-        batch_size = dataset.batch_size
-        acc_top1 = mx.metric.Accuracy()
-        acc_top5 = mx.metric.TopKAccuracy(5)
-        acc_top1.reset()
-        acc_top5.reset()
-
-        t_arr = []
-        # Execute
-        start = time.time()
-        for i, batch in enumerate(dataset):
-            # print("batch id : ", i)
-            # t0 = time.time()
-            
-            data, label = batch_fn(batch, [mx.cpu(0)])
-            # data = data[0].asnumpy()
-            t1 = time.time()
-            # print("batch_fn : %.3f"%(t1-t0))
-            
-            # import pdb; pdb.set_trace()
-            # out_arr = executor.evaluate()(data)
-            m.run(data=data[0].asnumpy())
-            # t2 = time.time() 
-            # print("m.run : %.3f"%(t2-t1))
-
-            out_arr = m.get_output(0)
-            # t3 = time.time()
-            # print("get_output : %.3f"%(t3-t2))
-            t_elapsed = time.time() - t1
-            t_arr.append(t_elapsed)
-            
-            acc_top1.update(label, [mx.nd.array(out_arr.asnumpy())])
-            acc_top5.update(label, [mx.nd.array(out_arr.asnumpy())])
-            # t4 = time.time()
-            # print("accuracy update : %.3f"%(t4-t3))
-            
-            if not (i + 1) % log_interval:
-                _, top1 = acc_top1.get()
-                _, top5 = acc_top5.get()
-                nsamples = (i + 1) * batch_size
-                logging.info('[%d samples] validation: acc-top1=%f acc-top5=%f', nsamples, top1, top5)
-            # print("batch %d time : %.3fs" % (i, time.time()-t0))
-        
-        end = time.time()
-        '''
-    
-    # logging.info('[final] validation: acc-top1=%f acc-top5=%f', top1, top5)
-    
-    ########################################################
-    # t_arr = np.array(t_arr[1:])*1000
-    # print("size:",t_arr.size)
-    # print(t_arr)
-    # print("latency : %.3fms(per image) (%d-batch: %.3fms(%.3fms))"%(t_arr.mean()/batch_size, batch_size, t_arr.mean(), t_arr.std()))
-    # print("Evaluation time : %.3fs"%(end-start))
-    ########################################################
-    # print("Tuning time : %.3f"%(tune_end-tune_start))
-    # return top1
-
 
 def get_calibration_dataset(dataset, batch_fn, num_samples=100):
     dataset.reset()
@@ -323,8 +240,10 @@ def get_calibration_dataset(dataset, batch_fn, num_samples=100):
     return hago.CalibrationDataset(batches)
 
 
-def test_quantize_acc(cfg, rec_val):
+def test_quantize(cfg, rec_val):
+    
     # qconfig = hago.qconfig(skip_conv_layers=[0], log_file='temp.log')
+    
     qconfig = hago.qconfig(use_channel_quantize=False, log_file='temp.log')
     batch_size = 32
     val_data, batch_fn = get_val_data(cfg.model, rec_val=rec_val, batch_size=batch_size)
@@ -336,18 +255,14 @@ def test_quantize_acc(cfg, rec_val):
         orig = False
         
     mod, params = get_model(cfg.model, batch_size, qconfig, dataset=dataset, original=orig)
-    tune_eval(mod, params, val_data, batch_fn, tuning_option, target='cuda', ctx=tvm.gpu(0))
-    
-    # print("Final accuracy", "fp32" if orig else "int8", acc)
-
-    # return acc
-
+    tune_eval(mod, params, tuning_option, target='cuda', ctx=tvm.gpu(0))
 
 if __name__ == "__main__":
+    
     #TODO(for user): replace the line with the path to imagenet validation dataset
-    rec_val = "./val.rec"
     # rec_val = "~/tensorflow_datasets/downloads/manual/imagenet2012/val_rec.rec"
-
+    
+    rec_val = "./val.rec"
     results = []
     configs = [
         Config('resnet18_v1', expected_acc=0.69),
@@ -355,10 +270,7 @@ if __name__ == "__main__":
         # Config('inceptionv3', expected_acc=0.76),
         # Config('mobilenet1.0', expected_acc=0.70)
     ]
-    # rec = hago.pick_best(".quantize_strategy_search.log", 'quant_acc')
-
+    
     for config in configs:
-        acc = test_quantize_acc(config, rec_val)
-        results.append((config, acc))
-    # for res in results:
-        # print("{}\nQuantized Accuracy: {} vs. Expected Accuracy: {}".format(res[0].model, res[1], res[0].expected_acc))
+        test_quantize(config, rec_val)
+        
